@@ -1,0 +1,1475 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+White-label two-tab bot — Telegram-connected (manual login first, DOM-only, no bookie APIs)
+
+Key features
+- Works across multiple white-label hosts (GentlemanJim, DragonBet, PricedUp, etc.)
+- Per-site staking / value / odds rules via BookieConfig (with easy CLI overrides)
+- Dedupe (only bet once per (race,dog) this run)
+- Robust overlay handling + bet receipt confirmation
+- Card-scoped homepage scan + meetings-grid support
+- Scroll & probe fallback to beat lazy-loading
+- Race-page verification/correction of (track, HH:MM)
+
+import asyncio
+import re
+import argparse
+from dataclasses import dataclass, replace
+from datetime import datetime
+from typing import Optional, Tuple, List, Dict, Set
+
+from telethon import TelegramClient, events
+from playwright.async_api import async_playwright, Page
+
+
+# -----------------------------
+# Per-site config
+# -----------------------------
+@dataclass
+class BookieConfig:
+    target_profit: float = 40.00        # Stake-to-win target
+    min_value_pct: float = 102.0        # Only bet if Telegram "Value" >= this %
+    max_odds: Optional[float] = None    # e.g. 5.0 → skip if tip odds > 5
+    odds_tolerance_abs: float = 0.02    # Accept tiny dip from tip "Back:"
+    odds_tolerance_pct: float = 0.0     # Optional relative tolerance (usually 0)
+
+# Friendly aliases → host
+SITE_PRESETS: Dict[str, str] = {
+    "pricedup":     "pricedup.bet",
+
+
+}
+
+# Site-specific defaults
+SITE_CONFIGS: Dict[str, BookieConfig] = {
+    "pricedup.bet":     BookieConfig(target_profit=40.00,  min_value_pct=102.0, max_odds=5.0),
+
+}
+
+# -----------------------------
+# Telegram credentials (replace for production)
+# -----------------------------
+API_ID    = XXX
+API_HASH  = "XXXX"
+BOT_TOKEN = "XXXX"
+
+# -----------------------------
+# Globals set by set_site()
+# -----------------------------
+SITE_HOST: str = ""
+SITE_ROOT: str = ""
+BASE_URL: str = ""
+SESSION_NAME: str = ""
+CFG: BookieConfig = BookieConfig()  # runtime-effective config
+
+# In-memory guard so we only bet once per (race,dog) this run
+PLACED_KEYS: Set[str] = set()
+
+# Optional: only act on Telegram messages that contain these brand names; [] means accept all
+BRAND_FILTERS: List[str] = []
+
+# --- Put these near your other constants ---
+NEXT_RACES_CONTAINER = "[data-component='NextRacesSportPage'], [data-component='NextRacesSliderList']"
+MEETINGS_GRID        = "section[data-component='MeetingsListView'] [data-component='SportMeetingsListWrapper']"
+MEETING_ROW          = "[data-component='SportMeetingsListRowWrapper']"
+
+# Race href only (ignore meeting links)
+_RACE_HREF_RE = re.compile(r"^/racecard/greyhoundracing/\d+/\d+(?:\?.*)?$")
+
+# -----------------------------
+# Skin-specific containers
+# -----------------------------
+NEXT_RACES_CONTAINER = "[data-component='NextRacesSportPage'], [data-component='NextRacesSliderList']"
+MEETINGS_GRID        = "section[data-component='MeetingsListView'] [data-component='SportMeetingsListWrapper']"
+MEETING_ROW          = "[data-component='SportMeetingsListRowWrapper']"
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+def to_dec(txt: str) -> Optional[float]:
+    if not txt:
+        return None
+    m = re.search(r"\d+(?:\.\d+)?", txt)
+    if m:
+        try:
+            return float(m.group(0))
+        except Exception:
+            pass
+    mf = re.search(r"(\d+)\s*/\s*(\d+)", txt)
+    if mf:
+        try:
+            n, d = float(mf.group(1)), float(mf.group(2))
+            return 1.0 + n / d
+        except Exception:
+            pass
+    return None
+
+def tip_is_stale(off_str: str, grace_seconds: int = 300) -> bool:
+    """Skip tips more than `grace_seconds` past off-time."""
+    try:
+        hh, mm = [int(x) for x in off_str.split(":")]
+        now = datetime.now()
+        off = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return (now - off).total_seconds() > grace_seconds
+    except:
+        return False
+
+async def _tile_text_for_link(a):
+    # Return text for the single tile that owns this link (avoids reading all tiles)
+    try:
+        return await a.evaluate("""
+        (el)=>{
+          const getTxt = n => (n && (n.innerText||'').toLowerCase()) || '';
+          const hasOne = n => n && n.querySelectorAll("a[href^='/racecard/greyhoundracing/']").length === 1;
+          let n=el, hops=0, last=el;
+          while(n && hops<10){ if(hasOne(n)) return getTxt(n); last=n; n=n.parentElement; }
+          return getTxt(last);
+        }""")
+    except:
+        return ""
+
+async def _anchor_best_text(a):
+    # Prefer visible anchor text; fall back to aria-label/title if present
+    txt = ""
+    try:    txt = (await a.inner_text()).strip().lower()
+    except: txt = ""
+    if not txt:
+        for attr in ("aria-label","title"):
+            try:
+                v = await a.get_attribute(attr)
+                if v: return v.strip().lower()
+            except:
+                pass
+    return txt
+
+# ---- Track normalization (aliases like "Star Pelaw" -> "Pelaw Grange")
+_BRAND_WORDS = {"star", "even", "seven", "bet", "sports", "sport", "book", "bookie"}
+TRACK_ALIASES = {
+    "pelaw": "pelaw grange",
+    "pelaw grange": "pelaw grange",
+    "star pelaw": "pelaw grange",
+    "towcester": "towcester",
+    "newcastle": "newcastle",
+    "hove": "hove",
+    "sunderland": "sunderland",
+    "harlow": "harlow",
+    "yarmouth": "yarmouth",
+}
+
+def normalize_track_name(raw: str) -> str:
+    s = (raw or "").strip().lower()
+    s = re.sub(r"[\s\-]+", " ", s)
+    tokens = [t for t in s.split() if t not in _BRAND_WORDS]
+    if not tokens:
+        tokens = s.split()
+    s2 = " ".join(tokens)
+    return TRACK_ALIASES.get(s2, s2)
+
+def min_acceptable_odds(want_odds: Optional[float]) -> Optional[float]:
+    """Apply absolute/relative tolerance from CFG."""
+    if not want_odds:
+        return None
+    want_odds = round(want_odds, 2)
+    floor_abs = want_odds - CFG.odds_tolerance_abs
+    floor_pct = want_odds * (1.0 - (CFG.odds_tolerance_pct / 100.0)) if CFG.odds_tolerance_pct > 0 else floor_abs
+    floor_ = max(1.01, min(floor_abs, floor_pct))
+    return round(floor_ + 1e-9, 2)
+
+# -----------------------------
+# Telegram message parser (your tip format)
+# -----------------------------
+def parse_telegram_message(text: str):
+    try:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        if len(lines) < 3:
+            return None
+
+        brand = lines[0].lower()
+        if BRAND_FILTERS and not any(b in brand for b in BRAND_FILTERS):
+            return None
+
+        dog = lines[1]
+        line2 = lines[2].replace("–", "-")
+        track, race_time = line2.split("-")
+        track = track.strip()
+        race_time = race_time.strip()
+
+        back_line = next((l for l in lines if l.lower().startswith("back:")), None)
+        back_odds = None
+        if back_line:
+            m = re.search(r"(\d+(?:\.\d+)?)", back_line)
+            if m:
+                back_odds = float(m.group(1))
+
+        value_line = next((l for l in lines if "value" in l.lower()), None)
+        value_pct = None
+        if value_line:
+            m = re.search(r"(\d+(?:\.\d+)?)\s*%", value_line)
+            if m:
+                value_pct = float(m.group(1))
+
+        return {
+            "dog": dog,
+            "track": track,
+            "time": race_time,
+            "back_odds": back_odds,
+            "value": value_pct,
+        }
+    except Exception as e:
+        print(f"❌ Parse error: {e}")
+        return None
+
+# -----------------------------
+# Overlay handling (hardened)
+# -----------------------------
+async def clear_blocking_overlays(page: Page, timeout_ms: int = 8000) -> bool:
+    """Dismiss common overlays; be robust to navigations/rehydrates."""
+    try:
+        if page.is_closed():
+            return False
+    except Exception:
+        return False
+
+    dismissed = False
+
+    patterns = [
+        ("div[data-component='RealityCheckPopup'], .RealityCheckPopupOverlay, .css-fjv5kt-PopupOverlay-RealityCheckPopupOverlay",
+         ["Continue", "OK", "I Understand", "Close", "Proceed"]),
+        ("[data-component*='Popup'], [role='dialog'], [class*='PopupOverlay'], .modal, .overlay",
+         ["Continue", "OK", "Close", "Got it", "Accept", "I agree"]),
+        ("[id*='cookie'], [class*='cookie'], [aria-label*='cookie']",
+         ["Accept", "I agree", "Got it"]),
+    ]
+
+    slice_timeout = max(1500, timeout_ms // max(1, len(patterns)))
+
+    for overlay_sel, btn_texts in patterns:
+        try:
+            overlay = page.locator(overlay_sel).first
+            if await overlay.count():
+                try:
+                    await overlay.wait_for(state="visible", timeout=slice_timeout)
+                except Exception:
+                    pass
+
+                if await overlay.is_visible():
+                    for t in btn_texts:
+                        btn = overlay.locator(f"button:has-text('{t}'), [role='button']:has-text('{t}')").first
+                        if await btn.count():
+                            try:
+                                await btn.click()
+                                dismissed = True
+                                break
+                            except Exception:
+                                try:
+                                    await btn.evaluate("el => el.click()")
+                                    dismissed = True
+                                    break
+                                except Exception:
+                                    pass
+
+                    if not dismissed:
+                        try:
+                            await page.keyboard.press("Escape")
+                            await page.wait_for_timeout(200)
+                            if not await overlay.is_visible():
+                                dismissed = True
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    return dismissed
+
+# Robust race-page readiness wait
+async def wait_for_race_page_ready(page: Page, timeout_ms: int = 45000) -> bool:
+    import time
+    start = time.monotonic()
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms // 3)
+    except Exception:
+        pass
+    await clear_blocking_overlays(page)
+
+    while (time.monotonic() - start) * 1000 < timeout_ms:
+        try:
+            if await page.locator("li[data-test='race-summary-row']").count():
+                return True
+            await clear_blocking_overlays(page)
+            await asyncio.sleep(0.25)
+        except Exception:
+            await asyncio.sleep(0.25)
+
+    try:
+        await page.reload(wait_until="domcontentloaded")
+        await clear_blocking_overlays(page)
+        await page.wait_for_selector("li[data-test='race-summary-row']", state="attached", timeout=8000)
+        return True
+    except Exception:
+        return False
+
+# -----------------------------
+# Tab A: Scanner (homepage)
+# -----------------------------
+async def ensure_day_tab(page: Page, label: str = "Today"):
+    """Make sure the 'Today' tab is active on the homepage grid."""
+    try:
+        btn = page.locator(f":is(button,[role='tab']):has-text('{label}')").first
+        if await btn.count():
+            aria = await btn.get_attribute("aria-selected")
+            if aria != "true":
+                try:
+                    await btn.click()
+                    await asyncio.sleep(0.15)
+                except:
+                    pass
+    except:
+        pass
+
+async def ensure_home_ready(pageA: Page):
+    if pageA.url != BASE_URL:
+        print("[scan] Navigating Tab A to homepage…")
+        await pageA.goto(BASE_URL, wait_until="domcontentloaded")
+    await clear_blocking_overlays(pageA)
+    await ensure_day_tab(pageA, "Today")
+    try:
+        host = pageA.locator('[data-component="ContentWrapperChildren"], main, body').first
+        await host.evaluate("(n)=>{try{n.scrollTop=0;n.scrollTop=n.scrollHeight;}catch(e){}}")
+    except Exception:
+        pass
+
+TIME_FUZZ_MIN = 0  # strict (no fuzzy time match on homepage)
+
+def _parse_hhmm_to_minutes(s: str) -> Optional[int]:
+    m = re.search(r"\b(\d{1,2}):(\d{2})\b", s or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    except Exception:
+        return None
+
+# href helpers (race vs meeting)
+_RACE_HREF_RE    = re.compile(r"^/racecard/greyhoundracing/\d+/\d+(?:\?.*)?$")
+_MEETING_HREF_RE = re.compile(r"^/racecard/greyhoundracing/\d+(?:\?.*)?$")
+def _is_race_href(href: Optional[str]) -> bool:    return bool(_RACE_HREF_RE.match(href or ""))
+def _is_meeting_href(href: Optional[str]) -> bool: return bool(_MEETING_HREF_RE.match(href or ""))
+
+async def _link_context_text(link) -> str:
+    """
+    Return text for the *single* Next-Races tile that owns this link.
+    We climb ancestors until we hit the tile list (NEXT_RACES_CONTAINER) or
+    a node that contains exactly one racecard link.
+    """
+    try:
+        return await link.evaluate(f"""
+            (el) => {{
+              const TILE_SEL = "{NEXT_RACES_CONTAINER}";
+              const getTxt = n => (n && (n.textContent||'').trim().toLowerCase()) || '';
+              const countRC = n => (n && n.querySelectorAll("a[href^='/racecard/greyhoundracing/']").length) || 0;
+              let n = el, hops = 0, last = el;
+              while (n && hops < 12) {{
+                if (n.matches && n.matches(TILE_SEL)) return getTxt(last);  // scope to the card
+                if (countRC(n) === 1) return getTxt(n);                      // single-card fallback
+                last = n; n = n.parentElement; hops++;
+              }}
+              // fallback: link + 2 ancestors
+              n = el; const parts = [];
+              for (let i=0;i<3 && n;i++,n=n.parentElement) {{
+                const t = getTxt(n); if (t) parts.push(t);
+              }}
+              return parts.join(' ');
+            }}
+        """)
+    except Exception:
+        return ""
+
+async def find_href_in_meetings_grid(pageA: Page, track: str, off_time: str) -> Optional[str]:
+    """Find a race/meeting href in the A-Z meetings grid for (track, time)."""
+    await ensure_home_ready(pageA)
+    grid = pageA.locator(MEETINGS_GRID).first
+    if not await grid.count():
+        return None
+
+    want_track = normalize_track_name(track)
+    tokens = [t for t in want_track.split() if len(t) > 2] or [want_track]
+    tokens = [t.lower() for t in tokens]
+
+    rows = grid.locator(MEETING_ROW)
+    n = await rows.count()
+    for i in range(n):
+        row = rows.nth(i)
+        try:
+            txt = (await row.inner_text()).lower()
+        except Exception:
+            continue
+        if not all(t in txt for t in tokens):
+            continue
+
+        # 1) Exact-time anchor inside the row (some skins link times directly)
+        time_link = row.locator(f"a[href^='/racecard/greyhoundracing/']:has-text('{off_time}')").first
+        if await time_link.count():
+            href = await time_link.get_attribute("href")
+            if href:
+                return href
+
+        # 2) Any race/meeting link in the row (we'll switch to HH:MM later)
+        any_link = row.locator("a[href^='/racecard/greyhoundracing/']").first
+        if await any_link.count():
+            href = await any_link.get_attribute("href")
+            if href:
+                return href
+
+    return None
+
+# --- Drop-in replacement for find_race_href_on_home ---
+async def find_race_href_on_home(pageA: Page, track: str, off_time: str) -> Optional[str]:
+    await ensure_home_ready(pageA)
+
+    want_track = normalize_track_name(track)
+    tokens = [t for t in want_track.split() if len(t) > 2] or [want_track]
+    tokens = [t.lower() for t in tokens]
+    t_lc   = off_time.strip().lower()
+
+    # ---- A1) Slider: race anchors, match on anchor/aria text
+    slider_as = pageA.locator(f"{NEXT_RACES_CONTAINER} a[href^='/racecard/greyhoundracing/']")
+    n = await slider_as.count()
+    for i in range(n):
+        a = slider_as.nth(i)
+        href = await a.get_attribute("href")
+        if not href or not _RACE_HREF_RE.match(href):
+            continue
+        txt = await _anchor_best_text(a)
+        if txt and (t_lc in txt) and all(tok in txt for tok in tokens):
+            print(f"[scan] Slider(anchor): {href}")
+            return href
+
+    # ---- A2) Slider fallback: tile-scoped context (when anchor is just 'View Racecard')
+    for i in range(n):
+        a = slider_as.nth(i)
+        if not await a.is_visible():
+            continue
+        href = await a.get_attribute("href")
+        if not href:
+            continue
+        tile_txt = await _tile_text_for_link(a)
+        if tile_txt and (t_lc in tile_txt) and all(tok in tile_txt for tok in tokens):
+            print(f"[scan] Slider(tile): {href}")
+            return href
+
+    # ---- B) Meetings grid: row contains track; pick race anchor whose anchor text has HH:MM
+    grid = pageA.locator(MEETINGS_GRID).first
+    if await grid.count():
+        rows = grid.locator(MEETING_ROW)
+        m = await rows.count()
+        for i in range(m):
+            row = rows.nth(i)
+            try:
+                row_txt = (await row.inner_text()).lower()
+            except:
+                continue
+            if not all(tok in row_txt for tok in tokens):
+                continue
+            anchors = row.locator("a[href^='/racecard/greyhoundracing/']")
+            k = await anchors.count()
+            for j in range(k):
+                a2 = anchors.nth(j)
+                href2 = await a2.get_attribute("href")
+                if not href2 or not _RACE_HREF_RE.match(href2):
+                    continue
+                a2_txt = await _anchor_best_text(a2)
+                if a2_txt and (t_lc in a2_txt):
+                    print(f"[scan] Meetings(anchor): {href2}")
+                    return href2
+
+    print(f"[scan] No race href matched for track='{want_track}' time='{off_time}'.")
+    return None
+# Scroll-aware collector for links (lazy-load support)
+async def _collect_home_race_links(pageA: Page, max_scrolls: int = 24) -> List[str]:
+    """
+    Slowly scrolls the homepage to force lazy content to load,
+    collecting unique /racecard/greyhoundracing/ links.
+    """
+    await ensure_home_ready(pageA)
+
+    container = pageA.locator("[data-component='ContentWrapperChildren'], main, body").first
+    seen: Set[str] = set()
+    out: List[str] = []
+
+    async def snap():
+        # Collect from both the Next Races area and the Meetings grid
+        links = pageA.locator("a[href^='/racecard/greyhoundracing/']")
+        n = await links.count()
+        for i in range(n):
+            href = await links.nth(i).get_attribute("href")
+            if href and href not in seen:
+                seen.add(href)
+                out.append(href)
+
+    try:
+        await container.evaluate("(n)=>{try{n.scrollTop=0;}catch(_){}}")
+    except:
+        pass
+    await snap()
+
+    for _ in range(max_scrolls):
+        try:
+            await container.evaluate("(n)=>{try{n.scrollTop = n.scrollHeight;}catch(_){}}")
+        except:
+            pass
+        try:
+            await pageA.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+        except:
+            pass
+        await asyncio.sleep(0.25)
+        await snap()
+
+    try:
+        await pageA.evaluate("window.scrollTo(0,0)")
+    except:
+        pass
+
+    print(f"[scan] Collected {len(out)} candidate links after scrolling.")
+    return out
+
+# Probe fallback: open candidate links to verify (track, HH:MM)
+async def resolve_race_by_probing(pageA: Page, pageB: Page, track: str, off_time: str, limit: int = 80) -> Optional[str]:
+    """
+    Scroll the homepage to load ALL meetings, then probe each candidate link
+    in Tab B until we find (normalized track == want_track) AND (time == HH:MM).
+    """
+    want_track = normalize_track_name(track)
+    want_time  = off_time
+
+    hrefs = await _collect_home_race_links(pageA, max_scrolls=24)
+    if not hrefs:
+        return None
+
+    tested = 0
+    for href in hrefs:
+        if tested >= limit:
+            break
+        tested += 1
+
+        url = href if href.startswith("http") else SITE_ROOT + href
+        try:
+            await pageB.goto(url, wait_until="domcontentloaded")
+            ok = await wait_for_race_page_ready(pageB, timeout_ms=15000)
+            if not ok:
+                continue
+
+            curr_track, curr_time = await read_race_header(pageB)
+
+            # If it's the right meeting but a MEETING page, switch tab to time
+            if curr_track == want_track:
+                if curr_time == want_time:
+                    return re.sub(r"^https?://[^/]+", "", pageB.url)
+                if _is_meeting_href(href):
+                    sw = await switch_to_race_time(pageB, want_time, fuzz_min=0)
+                    if sw:
+                        c2_track, c2_time = await read_race_header(pageB)
+                        if c2_track == want_track and c2_time == want_time:
+                            return re.sub(r"^https?://[^/]+", "", pageB.url)
+        except Exception:
+            continue
+
+    print(f"[scan] Probing exhausted ({tested} tested) without a match.")
+    return None
+
+# -----------------------------
+# Tab B: Action (race page)
+# -----------------------------
+async def select_win_only_if_present(page: Page):
+    for txt in ("Win Only", "Win"):
+        tab = page.locator(f"role=tab[name='{txt}']")
+        if await tab.count():
+            try:
+                await tab.first.click()
+                await asyncio.sleep(0.15)
+                return
+            except Exception:
+                pass
+    loc = page.locator("button:has-text('Win Only'), [data-test='market-tab']:has-text('Win')").first
+    if await loc.count():
+        try:
+            await loc.click()
+            print("[race] Selected market tab via generic button")
+        except Exception:
+            pass
+
+async def list_visible_runners(pageB: Page, limit: int = 20) -> List[str]:
+    race = pageB.locator('[data-test="race-card"][data-component="RaceCard"]').first
+    rows = race.locator("li[data-test='race-summary-row']")
+    out = []
+    n = await rows.count()
+    for i in range(min(n, limit)):
+        try:
+            t = await rows.nth(i).inner_text()
+            out.append(t.split("\n")[0].strip())
+        except Exception:
+            pass
+    return out
+
+async def add_runner_from_race_page(pageB: Page, runner_name: str) -> Tuple[bool, str]:
+    ok_ready = await wait_for_race_page_ready(pageB, timeout_ms=45000)
+    if not ok_ready:
+        return (False, "[race] Race UI did not become ready in time.")
+
+    race = pageB.locator('[data-test="race-card"][data-component="RaceCard"]').first
+    if not await race.count():
+        race = pageB
+
+    try:
+        await race.evaluate("(n)=>{n.scrollTop=0;n.scrollTop=n.scrollHeight}")
+    except Exception:
+        pass
+
+    await select_win_only_if_present(pageB)
+    await clear_blocking_overlays(pageB)
+
+    row = race.locator(
+        "li[data-test='race-summary-row'][data-component*='RaceSummaryRowGreyhoundRacing']"
+    ).filter(has_text=runner_name).first
+
+    target_norm = norm(runner_name)
+    if await row.count() == 0:
+        rows = race.locator("li[data-test='race-summary-row'][data-component*='RaceSummaryRowGreyhoundRacing']")
+        count = await rows.count()
+        match_idx = -1
+        for i in range(count):
+            it = rows.nth(i)
+            try:
+                t = await it.inner_text()
+            except Exception:
+                continue
+            if norm(t).find(target_norm) != -1:
+                match_idx = i
+                break
+        if match_idx >= 0:
+            row = rows.nth(match_idx)
+
+    if await row.count() == 0:
+        names = await list_visible_runners(pageB)
+        return (False, f"[race] Runner '{runner_name}' not found. Visible runners: {', '.join(names) if names else '(none found)'}")
+
+    for sel_css in (
+        "a[data-test-selection]",
+        "button[data-test-selection]",
+        "[data-component='PriceHistoryCell']",
+        ".price, .odds",
+        "a, button, [role='button']"
+    ):
+        sel = row.locator(sel_css).first
+        if await sel.count():
+            try:
+                await sel.click()
+                print(f"[race] Clicked selection via selector: {sel_css}")
+                return (True, "[race] Selection clicked.")
+            except Exception as e:
+                print(f"[race] Click failed on {sel_css}: {e}")
+                continue
+
+    return (False, "[race] Found row but no clickable selection/price element.")
+
+# --- Race header reader & time switchers
+async def read_race_header(page: Page) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Best-effort read of (track, HH:MM) currently shown on the race page.
+    Returns normalized track and 'HH:MM' if found.
+    """
+    header_selectors = [
+        "[data-component*='RaceHeader']",
+        "[data-test*='race-header']",
+        "header",
+        "main",
+    ]
+    header_txt = ""
+    for sel in header_selectors:
+        loc = page.locator(sel).first
+        if await loc.count():
+            try:
+                header_txt = (await loc.inner_text()).strip()
+                if header_txt:
+                    break
+            except:
+                pass
+    if not header_txt:
+        try:
+            header_txt = (await page.locator("body").inner_text())[:2000]
+        except:
+            header_txt = ""
+
+    # Extract HH:MM
+    m = re.search(r"\b(\d{1,2}:\d{2})\b", header_txt)
+    hhmm = m.group(1) if m else None
+
+    # Track: try breadcrumb/meeting link first
+    track_txt = None
+    try:
+        b = page.locator("a[href^='/racecard/greyhoundracing/']").first
+        if await b.count():
+            t = (await b.inner_text()).strip()
+            if t:
+                track_txt = t
+    except:
+        pass
+    if not track_txt:
+        for sel in ("header :is(h1,h2,h3)", "h1, h2, h3"):
+            h = page.locator(sel).first
+            if await h.count():
+                try:
+                    t = (await h.inner_text()).strip()
+                    if t:
+                        track_txt = t
+                        break
+                except:
+                    pass
+
+    return normalize_track_name(track_txt or ""), hhmm
+
+async def switch_to_race_time(page: Page, off_time: str, fuzz_min: int = 0) -> bool:
+    """
+    When we land on a meeting page (no race id in URL), explicitly click the race tab for HH:MM.
+    Returns True if we switched (or we were already on the correct time), else False.
+    """
+    import re as _re
+    target_min = _parse_hhmm_to_minutes(off_time)
+    if target_min is None:
+        return True
+
+    containers = [
+        "[data-component*='RaceCardNavigation']",
+        "[data-component*='RaceNavigation']",
+        "[data-test*='race']",
+        "nav",
+        "main"
+    ]
+
+    time_re = _re.compile(r"\b\d{1,2}:\d{2}\b")
+
+    for csel in containers:
+        cont = page.locator(csel).first
+        if not await cont.count():
+            continue
+
+        btns = cont.locator(":is(a,button,[role='tab'])").filter(has_text=time_re)
+        n = await btns.count()
+        if n == 0:
+            continue
+
+        best_i, best_dt = -1, 999
+        for i in range(n):
+            try:
+                txt = (await btns.nth(i).inner_text()).strip()
+            except Exception:
+                continue
+            cand_min = _parse_hhmm_to_minutes(txt)
+            if cand_min is None:
+                continue
+            dt = abs(cand_min - target_min)
+            if dt < best_dt and dt <= max(0, fuzz_min):
+                best_i, best_dt = i, dt
+
+        if best_i >= 0:
+            try:
+                await btns.nth(best_i).click()
+                await asyncio.sleep(0.2)
+                await wait_for_race_page_ready(page, timeout_ms=20000)
+                print(f"[nav] Switched to race tab time close to {off_time} (Δ={best_dt} min).")
+                return True
+            except Exception:
+                pass
+
+    return False
+
+# -----------------------------
+# Betslip (AccountSidebar)
+# -----------------------------
+CURRENCY_RE = re.compile(r"[£$€]")
+
+async def open_betslip(pageB: Page):
+    if await pageB.locator('aside[data-component="AccountSidebar"]').count():
+        return
+    for s in ("div[data-test='Tab']", "button:has-text('Betslip')", "button[aria-label*='Betslip']"):
+        loc = pageB.locator(s).first
+        if await loc.count():
+            try:
+                await loc.click()
+                await asyncio.sleep(0.15)
+                break
+            except Exception:
+                pass
+
+def _parse_odds_from_text(t: str) -> Optional[float]:
+    if not t:
+        return None
+    s = t.strip()
+    if s.upper() == "SP":
+        return None
+    low = s.lower()
+    if CURRENCY_RE.search(s) or ("stake" in low) or ("return" in low) or ("returns" in low):
+        return None
+    mf = re.search(r"\b(\d+)\s*/\s*(\d+)\b", s)
+    if mf:
+        try:
+            n, d = float(mf.group(1)), float(mf.group(2))
+            return 1.0 + n / d
+        except:
+            return None
+    md = re.search(r"\b\d+(?:\.\d+)?\b", s)
+    if md:
+        try:
+            return float(md.group(0))
+        except:
+            return None
+    return None
+
+async def read_betslip_price_for_runner(pageB: Page, runner_name: str) -> Tuple[Optional[float], str]:
+    await open_betslip(pageB)
+    aside = pageB.locator('aside[data-component="AccountSidebar"]')
+    if await aside.count() == 0:
+        return (None, "[betslip] AccountSidebar not found.")
+
+    item = aside.locator(
+        "[data-test='betslip-item'], [data-component*='BetItem'], .betItem, [class*='bet']"
+    ).filter(has_text=runner_name).first
+    if await item.count() == 0:
+        item = aside  # fallback
+
+    candidates = [
+        "[data-test='selection-odds']",
+        "[data-component*='Odds']",
+        "[class*='odds']",
+        "[class*='price']",
+        "button:has-text('/')",
+        "button:has-text('.')",
+        "span:has-text('/')",
+        "span:has-text('.')",
+        "input[aria-label*='odds']",
+    ]
+
+    for sel in candidates:
+        el = item.locator(sel).first
+        if not await el.count():
+            continue
+        txt = ""
+        try:
+            txt = (await el.inner_text()).strip()
+        except:
+            try:
+                txt = (await el.input_value()).strip()
+            except:
+                txt = ""
+
+        if txt.strip().upper() == "SP":
+            return (None, "[betslip] SP shown — no numeric odds.")
+
+        dec = _parse_odds_from_text(txt)
+        if dec is not None:
+            return (dec, f"[betslip] Matched odds via '{sel}' → {dec}")
+
+    return (None, "[betslip] No numeric odds element found (SP or missing).")
+
+async def click_place_bet_button(pageB: Page) -> Tuple[bool, str]:
+    aside = pageB.locator('aside[data-component="AccountSidebar"]')
+    if not await aside.count():
+        return (False, "[betslip] AccountSidebar not found.")
+
+    try:
+        await aside.evaluate("(n)=>{n.scrollTop = n.scrollHeight}")
+        await asyncio.sleep(0.1)
+    except:
+        pass
+
+    structure_selectors = [
+        "aside[data-component='AccountSidebar'] [data-component='BetSlipButtons'] [data-component='PlaceButtons'] button",
+        "aside[data-component='AccountSidebar'] [data-component='BetSlipButtons'] [data-component='PlaceButtons'] [role='button']",
+    ]
+    text_fallbacks = [
+        "aside[data-component='AccountSidebar'] button:has-text('Place Bet')",
+        "aside[data-component='AccountSidebar'] [role='button']:has-text('Place Bet')",
+        "aside[data-component='AccountSidebar'] :has-text('Place Bet £')",
+    ]
+
+    for sel in structure_selectors + text_fallbacks:
+        btn = pageB.locator(sel).first
+        if await btn.count():
+            try:
+                await btn.scroll_into_view_if_needed()
+                if await btn.is_visible():
+                    try:
+                        await btn.click()
+                        return (True, f"[betslip] Clicked Place Bet via '{sel}'.")
+                    except:
+                        box = await btn.bounding_box()
+                        if box:
+                            await pageB.mouse.click(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
+                            return (True, f"[betslip] Mouse-clicked Place Bet via '{sel}'.")
+                        await btn.evaluate("el => el.click()")
+                        return (True, f"[betslip] DOM-clicked Place Bet via '{sel}'.")
+            except Exception as e:
+                print(f"[betslip] Click attempt failed on {sel}: {e}")
+
+    try:
+        snippet = (await aside.inner_text())[:600]
+        return (False, "[betslip] Place Bet button not found. Sidebar snippet:\n" + snippet)
+    except:
+        return (False, "[betslip] Place Bet button not found and sidebar unreadable.")
+
+async def remove_selection_from_betslip(pageB: Page, runner_name: str) -> bool:
+    aside = pageB.locator('aside[data-component="AccountSidebar"]')
+    if not await aside.count():
+        return False
+
+    item = aside.locator(
+        "[data-test='betslip-item'], [data-component*='BetItem'], .betItem, [class*='bet']"
+    ).filter(has_text=runner_name).first
+    if not await item.count():
+        return await remove_all_from_betslip(pageB)
+
+    remove_selectors = [
+        "[aria-label='Remove']",
+        "button:has-text('Remove')",
+        "[data-test='remove']",
+        "[data-component*='Remove']",
+        ".bet-item__remove",
+        ".remove", ".trash", "svg[aria-hidden='true']",
+    ]
+    for sel in remove_selectors:
+        btn = item.locator(sel).first
+        if await btn.count():
+            try:
+                await btn.scroll_into_view_if_needed()
+                await btn.click()
+                await asyncio.sleep(0.1)
+                return True
+            except Exception:
+                continue
+
+    return await remove_all_from_betslip(pageB)
+
+async def remove_all_from_betslip(pageB: Page) -> bool:
+    aside = pageB.locator('aside[data-component="AccountSidebar"]')
+    if not await aside.count():
+        return False
+
+    for sel in (
+        "aside[data-component='AccountSidebar'] button:has-text('Remove all')",
+        "aside[data-component='AccountSidebar'] [role='button']:has-text('Remove all')",
+        "aside[data-component='AccountSidebar'] a:has-text('Remove all')",
+    ):
+        btn = pageB.locator(sel).first
+        if await btn.count():
+            try:
+                await btn.scroll_into_view_if_needed()
+                await btn.click()
+                await asyncio.sleep(0.2)
+                return True
+            except Exception:
+                pass
+
+    for _ in range(12):
+        rm = aside.locator(
+            ".bet-item__remove, [aria-label='Remove'], button:has-text('Remove'), .remove, .trash"
+        ).first
+        if not await rm.count():
+            break
+        try:
+            await rm.click()
+            await asyncio.sleep(0.1)
+        except Exception:
+            break
+
+    return not await aside.locator(
+        "[data-test='betslip-item'], [data-component*='BetItem'], .betItem"
+    ).count()
+
+# -----------------------------
+# Receipt confirmation
+# -----------------------------
+_MONEY_RE = re.compile(r"[£€$]\s*([0-9]+(?:\.[0-9]{1,2})?)")
+
+async def wait_for_receipt(pageB: Page, expected_stake: float, expected_odds: float,
+                           timeout_ms: int = 15000) -> Tuple[bool, str]:
+    aside = pageB.locator('aside[data-component="AccountSidebar"]')
+    if not await aside.count():
+        return (False, "[betslip] Sidebar disappeared while waiting for receipt.")
+
+    try:
+        before_count = await aside.locator(":has-text('BET RECEIPT')").count()
+    except Exception:
+        before_count = 0
+
+    error = aside.locator(
+        ":is([role='alert'], [data-test*='error'], [class*='error'], .toast, .banner)"
+    )
+
+    try:
+        await pageB.wait_for_function(
+            """
+            ({before}) => {
+              const aside = document.querySelector('aside[data-component="AccountSidebar"]');
+              if (!aside) return false;
+              const nodes = [...aside.querySelectorAll('*')];
+              const receiptCount = nodes.filter(n => {
+                  const t = (n.textContent||'').trim();
+                  return /BET RECEIPT/i.test(t) && /successfully placed/i.test(t);
+              }).length;
+              const hasErr = nodes.some(n => /error|insufficient|minim|suspend|reject|declin|login|price|change/i.test(n.textContent||''));
+              return receiptCount > before || hasErr;
+            }
+            """,
+            arg={"before": before_count},
+            timeout=timeout_ms
+        )
+    except Exception:
+        try:
+            if await error.count() and await error.first.is_visible():
+                msg = (await error.first.inner_text()).strip()
+                return (False, f"[betslip] Bookmaker rejected the bet: {msg}")
+        except Exception:
+            pass
+        return (False, "[betslip] No receipt or error appeared (timeout).")
+
+    new_receipts = aside.locator(":has-text('BET RECEIPT')").last
+    if not await new_receipts.count():
+        try:
+            if await error.count() and await error.first.is_visible():
+                msg = (await error.first.inner_text()).strip()
+                return (False, f"[betslip] Bookmaker rejected the bet: {msg}")
+        except Exception:
+            pass
+    else:
+        try:
+            txt = (await new_receipts.inner_text()).replace("\n", " ")
+        except Exception:
+            txt = ""
+
+        stake_m = re.search(r"Total\s+Stake[^£€$]*" + _MONEY_RE.pattern, txt)
+        rets_m  = re.search(r"Total\s+Potential\s+Returns[^£€$]*" + _MONEY_RE.pattern, txt)
+        stake_ui = float(stake_m.group(1)) if stake_m else None
+        rets_ui  = float(rets_m.group(1)) if rets_m else None
+
+        expected_returns = round(expected_stake * expected_odds, 2)
+        ok_amounts = (
+            (stake_ui is None or abs(stake_ui - expected_stake) <= 0.01) and
+            (rets_ui  is None or abs(rets_ui  - expected_returns) <= 0.02)
+        )
+
+        if ok_amounts:
+            return (True, "[decision] Bet confirmed (receipt visible).")
+        else:
+            return (True, f"[decision] Bet confirmed (receipt visible) but amounts differ "
+                          f"(UI stake={stake_ui}, UI returns={rets_ui}).")
+
+    try:
+        if await error.count() and await error.first.is_visible():
+            msg = (await error.first.inner_text()).strip()
+            return (False, f"[betslip] Bookmaker rejected the bet: {msg}")
+    except Exception:
+        pass
+    return (False, "[betslip] Could not confirm bet (no receipt).")
+
+# -----------------------------
+# Placement logic (uses CFG)
+# -----------------------------
+async def place_bet_if_price_ok(pageB: Page, runner_name: str, want_odds: float) -> Tuple[bool, str]:
+    price, why = await read_betslip_price_for_runner(pageB, runner_name)
+    print(why)
+
+    if price is None:
+        removed = await remove_selection_from_betslip(pageB, runner_name)
+        print("[betslip] Removed SP/missing-odds selection." if removed else "[betslip] Could not remove SP/missing-odds selection.")
+        return (False, "[decision] No price available in betslip (SP or missing odds).")
+
+    min_ok = min_acceptable_odds(want_odds)
+    if min_ok and price + 1e-9 < min_ok:
+        _ = await remove_selection_from_betslip(pageB, runner_name)
+        print(f"[decision] Odds too low: current={price}, target={want_odds}, min_ok={min_ok}.")
+        return (False, f"[decision] Odds too low: current={price}, target={want_odds}, min_ok={min_ok}.")
+
+    # Stake-to-win at the CURRENT price
+    stake = CFG.target_profit / max(price - 1.0, 0.01)
+    stake = round(stake, 2)
+
+    aside = pageB.locator('aside[data-component="AccountSidebar"]')
+    stake_inputs = aside.locator("input[type='number'], input[role='spinbutton'], input")
+    filled = False
+    n = await stake_inputs.count()
+    for i in range(min(n, 5)):
+        inp = stake_inputs.nth(i)
+        try_item = aside.locator("[data-test='betslip-item'], .betItem").filter(has_text=runner_name).first.locator("input[type='number'], input")
+        if await try_item.count():
+            inp = try_item.first
+        try:
+            await inp.fill(str(stake))
+            filled = True
+            print(f"[betslip] Entered stake £{stake:.2f} (target win £{CFG.target_profit:.2f} @ {price}).")
+            break
+        except:
+            continue
+    if not filled:
+        print("[betslip] Could not find a stake input; trying to place anyway.")
+
+    # Accept price change if prompted (pre-click)
+    for apc in (
+        "aside[data-component='AccountSidebar'] button:has-text('Accept Price Changes')",
+        "aside[data-component='AccountSidebar'] button:has-text('Accept')",
+        "aside[data-component='AccountSidebar'] [role='button']:has-text('Accept')",
+    ):
+        btn = aside.locator(apc).first
+        if await btn.count() and await btn.is_visible():
+            try:
+                await btn.click()
+                print("[betslip] Accepted price change prompt.")
+                break
+            except:
+                pass
+
+    await clear_blocking_overlays(pageB)
+    clicked, msg = await click_place_bet_button(pageB)
+    print(msg)
+    if not clicked:
+        return (False, "[betslip] Could not find/place the bet button.")
+
+    # Handle post-click Accept prompts; try a second click if needed
+    for _ in range(2):
+        accept_btn = aside.locator(":is(button,[role='button']):has-text('Accept')").first
+        try:
+            if await accept_btn.count() and await accept_btn.is_visible():
+                await accept_btn.click()
+                print("[betslip] Accepted price change after click.")
+                clicked2, msg2 = await click_place_bet_button(pageB)
+                print(msg2)
+                if not clicked2:
+                    break
+            else:
+                break
+        except Exception:
+            break
+
+    ok, final_msg = await wait_for_receipt(pageB, expected_stake=stake, expected_odds=price, timeout_ms=15000)
+    return (ok, final_msg)
+
+# -----------------------------
+# Dedupe key
+# -----------------------------
+def make_bet_key(track: str, race_time: str, dog: str, href: Optional[str] = None) -> str:
+    dog_key = norm(dog)
+    if href:
+        m = re.search(r"/racecard/greyhoundracing/(\d+)/(\d+)", href or "")
+        race_ids = "-".join(m.groups()) if m else href
+        return f"race:{race_ids}|{dog_key}"
+    return f"ptt:{normalize_track_name(track)}|{race_time.strip()}|{dog_key}"
+
+# -----------------------------
+# Tip handling (uses CFG)
+# -----------------------------
+async def handle_tip(pageA: Page, pageB: Page, tip_text: str):
+    # Normalize incoming text
+    if "\\n" in tip_text and ("\n" not in tip_text):
+        tip_text = tip_text.replace("\\n", "\n")
+
+    tip = parse_telegram_message(tip_text)
+    if not tip:
+        return
+
+    # Time/quality gates
+    if tip_is_stale(tip["time"]):
+        print("ℹ️ Tip skipped: race time already passed (beyond grace).")
+        return
+    if tip.get("value") is None or tip["value"] < CFG.min_value_pct:
+        print(f"ℹ️ Tip skipped: Value {tip.get('value')}% below threshold {CFG.min_value_pct}%.")
+        return
+    if CFG.max_odds is not None and tip.get("back_odds") and tip["back_odds"] > CFG.max_odds:
+        print(f"ℹ️ Tip skipped: tip Back {tip['back_odds']} exceeds max_odds {CFG.max_odds}.")
+        return
+
+    # Dedupe before navigation
+    provisional_key = make_bet_key(tip["track"], tip["time"], tip["dog"], href=None)
+    if provisional_key in PLACED_KEYS:
+        print(f"ℹ️ Skipped duplicate: already bet this dog for this race window ({provisional_key}).")
+        return
+
+    # Clean slate betslip
+    await remove_all_from_betslip(pageB)
+
+    print(f"[tip] Parsed: runner='{tip['dog']}' track='{tip['track']}' time='{tip['time']}' "
+          f"want>={tip['back_odds']} value={tip.get('value')}%")
+
+    # ---- Find race/meeting link (fast path)
+    href = await find_race_href_on_home(pageA, tip["track"], tip["time"])
+    if not href:
+        print("❌ Could not locate race on homepage.")
+        return
+
+    url = href if href.startswith("http") else SITE_ROOT + href
+    print(f"[nav] Tab B → {url}")
+    await pageB.goto(url, wait_until="domcontentloaded")
+    ok_ready = await wait_for_race_page_ready(pageB, timeout_ms=45000)
+    if not ok_ready:
+        print("❌ Race UI did not become ready in time.")
+        return
+
+    # --- FAST PATH ONLY ---
+    # Trust the href we clicked. If it's a MEETING page (no raceId), click the exact HH:MM tab.
+    try:
+        path = re.sub(r"^https?://[^/]+", "", pageB.url)
+    except Exception:
+        path = href
+
+    m = re.match(r"^/racecard/greyhoundracing/(\d+)(?:/(\d+))?", path or "")
+    if m and m.group(2) is None:  # meeting page → pick exact time
+        t = tip["time"]
+        btn = pageB.locator(f":is(a,button,[role='tab']):has-text('{t}')").first
+        if await btn.count():
+            try:
+                await btn.click()
+                await wait_for_race_page_ready(pageB, timeout_ms=15000)
+                print(f"[nav] Switched to {t} tab.")
+            except Exception:
+                pass
+
+    # Dedupe using current URL (race or meeting path both fine)
+    try:
+        curr_path = re.sub(r"^https?://[^/]+", "", pageB.url)
+    except Exception:
+        curr_path = path or href
+
+    final_key = make_bet_key(tip["track"], tip["time"], tip["dog"], href=curr_path)
+    if final_key in PLACED_KEYS:
+        print(f"ℹ️ Skipped duplicate: already bet this dog for this race ({final_key}).")
+        return
+
+    # Select runner and place bet
+    ok, msg = await add_runner_from_race_page(pageB, tip["dog"])
+    if not ok:
+        print(f"❌ {msg}")
+        return
+
+    placed, reason = await place_bet_if_price_ok(pageB, tip["dog"], tip["back_odds"] or 0.0)
+    if placed:
+        PLACED_KEYS.add(provisional_key)
+        PLACED_KEYS.add(final_key)
+        print(f"✅ {reason}  (dedupe keys saved)")
+    else:
+        print(f"ℹ️ {reason}")
+
+# -----------------------------
+# Overlay sweeper (periodic)
+# -----------------------------
+async def overlay_sweeper(pageA: Page, pageB: Page, interval_seconds: float = 10.0):
+    while True:
+        try:
+            await clear_blocking_overlays(pageA)
+            await clear_blocking_overlays(pageB)
+        except Exception:
+            pass
+        await asyncio.sleep(interval_seconds)
+
+# -----------------------------
+# Site setup + CLI overrides
+# -----------------------------
+def set_site(site: Optional[str], host: Optional[str],
+             min_value: Optional[float],
+             target_profit: Optional[float],
+             max_odds: Optional[float],
+             tol_abs: Optional[float],
+             tol_pct: Optional[float]) -> None:
+    """Compute host/urls/session and prepare CFG from SITE_CONFIGS + CLI overrides."""
+    global SITE_HOST, SITE_ROOT, BASE_URL, SESSION_NAME, CFG
+
+    # Resolve host
+    if site and site.lower() in SITE_PRESETS:
+        SITE_HOST = SITE_PRESETS[site.lower()]
+    elif host:
+        SITE_HOST = host.strip().lower()
+    else:
+        SITE_HOST = SITE_PRESETS["gentlemanjim"]
+
+    # Build URLs
+    SITE_ROOT = f"https://{SITE_HOST}"
+    BASE_URL  = f"{SITE_ROOT}/sport/greyhoundracing"
+    SESSION_NAME = f"wl_{SITE_HOST.replace('.', '_')}_session"
+
+    # Base config (per-host) or default
+    base_cfg = SITE_CONFIGS.get(SITE_HOST, BookieConfig())
+
+    # Apply CLI overrides if present
+    cfg = base_cfg
+    if min_value is not None:
+        cfg = replace(cfg, min_value_pct=float(min_value))
+    if target_profit is not None:
+        cfg = replace(cfg, target_profit=float(target_profit))
+    if max_odds is not None:
+        cfg = replace(cfg, max_odds=float(max_odds))
+    if tol_abs is not None:
+        cfg = replace(cfg, odds_tolerance_abs=float(tol_abs))
+    if tol_pct is not None:
+        cfg = replace(cfg, odds_tolerance_pct=float(tol_pct))
+
+    CFG = cfg
+
+    print(f"[site] Host={SITE_HOST} | BASE_URL={BASE_URL}")
+    print(f"[cfg]  target_profit={CFG.target_profit}  min_value_pct={CFG.min_value_pct}  "
+          f"max_odds={CFG.max_odds}  tol_abs={CFG.odds_tolerance_abs}  tol_pct={CFG.odds_tolerance_pct}")
+
+# -----------------------------
+# Orchestration (browser + Telegram)
+# -----------------------------
+async def run_bot():
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=False)
+        context = await browser.new_context()
+
+        # Two tabs
+        pageA = await context.new_page()
+        try:
+            print(f"[nav] Tab A → {BASE_URL}")
+            await pageA.goto(BASE_URL, wait_until="domcontentloaded")
+        except Exception as e:
+            print(f"[nav] Failed to load homepage {BASE_URL}: {e}")
+
+        try:
+            await clear_blocking_overlays(pageA)
+        except Exception as e:
+            print(f"[overlay] Initial sweep on pageA skipped: {e}")
+
+        pageB = await context.new_page()
+        try:
+            await pageB.goto("about:blank")
+        except Exception as e:
+            print(f"[nav] Could not open about:blank on Tab B: {e}")
+
+        try:
+            await clear_blocking_overlays(pageB)
+        except Exception as e:
+            print(f"[overlay] Initial sweep on pageB skipped: {e}")
+
+        print(f"Site: {SITE_HOST}  |  Session: {SESSION_NAME}")
+        print("Please log in on Tab A (first tab). Handle any cookie/geo/age banners.")
+        input("Press Enter here once logged in...")
+
+        # Post-login settle
+        for p, name in ((pageA, "pageA"), (pageB, "pageB")):
+            try:
+                await p.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception as e:
+                print(f"[nav] Post-login load-state skip on {name}: {e}")
+
+        # Make first overlay sweeps non-fatal
+        try:
+            await clear_blocking_overlays(pageA)
+        except Exception as e:
+            print(f"[overlay] Skipped overlay sweep on pageA after login: {e}")
+        try:
+            await clear_blocking_overlays(pageB)
+        except Exception as e:
+            print(f"[overlay] Skipped overlay sweep on pageB after login: {e}")
+
+        # Telegram client
+        client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+        await client.start(bot_token=BOT_TOKEN)
+        print("🤖 Listening for Telegram tips... (Ctrl+C to stop)")
+
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        processing_lock = asyncio.Lock()
+
+        @client.on(events.NewMessage)
+        async def _on_msg(event):
+            try:
+                text = event.message.raw_text or ""
+                if BRAND_FILTERS and not any(b in text.lower() for b in BRAND_FILTERS):
+                    return
+                await queue.put(text)
+            except Exception as e:
+                print(f"⚠️ Telegram handler error: {e}")
+
+        async def worker():
+            while True:
+                tip_text = await queue.get()
+                try:
+                    async with processing_lock:
+                        await handle_tip(pageA, pageB, tip_text)
+                except Exception as e:
+                    print(f"⚠️ handle_tip error: {e}")
+                finally:
+                    queue.task_done()
+
+        worker_task = asyncio.create_task(worker())
+        sweeper_task = asyncio.create_task(overlay_sweeper(pageA, pageB, interval_seconds=10.0))
+
+        try:
+            await client.run_until_disconnected()
+        finally:
+            for task in (worker_task, sweeper_task):
+                task.cancel()
+                try:
+                    await task
+                except Exception:
+                    pass
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+# -----------------------------
+# CLI
+# -----------------------------
+async def main():
+    parser = argparse.ArgumentParser(description="White-label Telegram two-tab bot (manual login, DOM-only)")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--site", type=str, help=f"Preset alias: {', '.join(SITE_PRESETS.keys())}")
+    group.add_argument("--host", type=str, help="Explicit host, e.g. dragonbet.co.uk")
+
+    # Per-site rule overrides (optional)
+    parser.add_argument("--min-value", type=float, help="Min Value%% gate (e.g. 102)")
+    parser.add_argument("--target-profit", type=float, help="Stake-to-win target profit (e.g. 60)")
+    parser.add_argument("--max-odds", type=float, help="Skip if tip Back exceeds this (e.g. 5)")
+    parser.add_argument("--odds-tol-abs", type=float, help="Absolute price tolerance (default 0.02)")
+    parser.add_argument("--odds-tol-pct", type=float, help="Relative price tolerance in percent")
+
+    parser.add_argument("--dry-run", type=str, help="Test a single tip text (\\n between lines)")
+    args = parser.parse_args()
+
+    set_site(args.site, args.host, args.min_value, args.target_profit, args.max_odds, args.odds_tol_abs, args.odds_tol_pct)
+
+    if args.dry_run:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=False)
+            context = await browser.new_context()
+            pageA = await context.new_page(); await pageA.goto(BASE_URL, wait_until="domcontentloaded")
+            await clear_blocking_overlays(pageA); await ensure_day_tab(pageA, "Today")
+            pageB = await context.new_page(); await pageB.goto("about:blank")
+            await clear_blocking_overlays(pageB)
+
+            print("Please log in on Tab A (first tab).")
+            input("Press Enter here once logged in...")
+
+            sweeper_task = asyncio.create_task(overlay_sweeper(pageA, pageB, interval_seconds=10.0))
+            await handle_tip(pageA, pageB, args.dry_run)
+
+            print("\n-- Browser left open. Press Ctrl+C to exit --")
+            try:
+                while True:
+                    await asyncio.sleep(3600)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                sweeper_task.cancel()
+
+            await context.close(); await browser.close()
+    else:
+        await run_bot()
+
+if __name__ == "__main__":
+    asyncio.run(main())
