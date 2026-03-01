@@ -11,13 +11,17 @@ Flow
 """
 
 import asyncio
-import re
 import os
+import re
 import time as monotime
 import argparse
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime, date, time, timezone, timedelta
-from typing import Optional, Tuple, List, Dict, Set
+from pathlib import Path
+from typing import Optional, Tuple, Dict, Set
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
 
 import logging
 
@@ -29,8 +33,18 @@ logging.basicConfig(
 logger = logging.getLogger("betmaster")
 logger.setLevel(logging.INFO)
 
-from telethon import TelegramClient, events
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import Page
+from telegram_handler import setup_telegram
+from config import CFG
+from session_manager import (
+    make_persistent_browser,
+    ui_keepalive,
+    session_heartbeat,
+    is_logged_out,
+    ensure_logged_in,
+    clear_blocking_overlays,
+    overlay_sweeper,
+)
 
 from zoneinfo import ZoneInfo  # Python 3.9+
 
@@ -48,9 +62,6 @@ try:
 except Exception:
     _LONDON_TZ = None  # we'll fall back to a coarse offset below
     
-
-# --- Persistent Playwright setup ---
-PROFILE_PATH = r"C:\Users\alexa\PlaywrightProfiles\Rainbow"
 
 ATTEMPTED_KEYS: set[str] = set()
 
@@ -72,119 +83,22 @@ async def clear_betslip(page: Page):
             return
 
 
-async def ui_keepalive(page: Page, interval_seconds: int = 240):
-    """
-    Periodically performs harmless UI actions to keep session alive.
-    """
-    while True:
-        try:
-            if page.is_closed():
-                return
-
-            # Small scroll
-            await page.mouse.wheel(0, 50)
-            await page.wait_for_timeout(200)
-            await page.mouse.wheel(0, -50)
-
-            # Focus body
-            await page.evaluate("() => document.body.focus()")
-
-            logger.debug("[keepalive] UI heartbeat sent")
-
-        except Exception:
-            pass
-
-        await asyncio.sleep(interval_seconds)
-
-
-async def make_persistent_browser():
-    """
-    Launch a fully controlled Playwright Chromium window with a persistent profile.
-    This fixes all DOM hydration issues that occur with CDP attach.
-    """
-    from playwright.async_api import async_playwright
-
-    pw = await async_playwright().start()
-
-    context = await pw.chromium.launch_persistent_context(
-        user_data_dir=PROFILE_PATH,
-        headless=False,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--no-default-browser-check",
-            "--no-first-run",
-        ],
-    )
-
-    # Ensure two tabs exist
-    pages = context.pages
-    pageA = pages[0] if pages else await context.new_page()
-    pageB = pages[1] if len(pages) > 1 else await context.new_page()
-
-    print("[browser] ✅ Launched Playwright persistent browser (DOM fully hydrated).")
-    return pw, context, pageA, pageB
-
-
-# -----------------------------
-# Login credentials (ENV preferred)
-# -----------------------------
-RR_USERNAME = os.getenv("RR_USERNAME", "YOUR_USERNAME_HERE")
-RR_PASSWORD = os.getenv("RR_PASSWORD", "YOUR_PASSWORD_HERE")
-
 # -----------------------------
 # Config
 # -----------------------------
 
-RR_HOST = "www.rainbowrichescasino.com"
+RR_HOST      = os.environ["RR_HOST"]
 RR_SITE_ROOT = f"https://{RR_HOST}"
-RR_RACE_URL = RR_SITE_ROOT + "/sports#racing/event/{event_id}"
+RR_RACE_URL  = RR_SITE_ROOT + "/sports#racing/event/{event_id}"
+BASE_URL     = f"https://{RR_HOST}/sports#racing/greyhounds/nextoff"
 
-BASE_URL = "https://www.rainbowrichescasino.com/sports#racing/greyhounds/nextoff"
-
-# Kambi greyhound racing feed (example – adjust once you confirm exact endpoint)
-RR_RACING_FEED = (
-    "https://eu1.offering-api.kambicdn.com/"
-    "offering/v2018/rrichesuk/betoffer/group/2000065087.json"
-    "?lang=en_GB&market=GB&client_id=200&channel_id=1"
-    "&maxNumberEvents=20&excludeOngoing=true"
-)
-
-# -----------------------------
-# Session heartbeat (Kambi)
-# -----------------------------
-RR_OPEN_HEARTBEAT_URL = (
-    "https://eu1.offering-api.kambicdn.com/"
-    "offering/v2018/rrichesuk/event/live/open.json"
-    "?lang=en_GB&market=GB&client_id=200&channel_id=1"
-)
-
-# Stake & price rules
-@dataclass
-class BookieConfig:
-    target_profit: float = 15.00        # Stake-to-win target
-    min_value_pct: float = 104.0        # Only bet if Telegram "Value" >= this %
-    max_odds: Optional[float] = None    # e.g. 5.0 → skip if tip odds > 5
-    odds_tolerance_abs: float = 0.02    # Accept tiny dip from tip "Back:"
-    odds_tolerance_pct: float = 0.0     # Optional relative tolerance
-
-CFG = BookieConfig()
+RR_RACING_FEED = os.environ["RR_RACING_FEED"]
 
 def calculate_stake(target_profit: float, back_odds: float) -> float:
     if back_odds <= 1.01:
         return round(target_profit, 2)
     return round(target_profit / (back_odds - 1.0), 2)
 
-
-# Telegram credentials (replace in prod)
-API_ID    = ******
-API_HASH  = ******
-BOT_TOKEN = ******
-
-SESSION_NAME = "Rainbow_session"
-
-# Optional: only act on Telegram messages that contain these brand names; [] means accept all
-BRAND_FILTERS: List[str] = []
 
 # -----------------------------
 # Utilities / Normalizers
@@ -241,61 +155,6 @@ def min_acceptable_odds(want_odds: Optional[float]) -> Optional[float]:
     return round(floor_ + 1e-9, 2)
 
 
-async def is_logged_out(page: Page) -> bool:
-    """
-    Logged-out = Login / Join Now buttons visible
-    """
-    try:
-        login_btn = page.locator("button, a").filter(
-            has_text=re.compile(r"(login|join)", re.I)
-        )
-        return await login_btn.count() > 0
-    except Exception:
-        return False
-
-async def session_heartbeat(context, interval_seconds: int = 180):
-    """
-    Periodically call Kambi open.json to keep auth session alive.
-    This does NOT touch the UI.
-    """
-    logger.info("💓 Session heartbeat started (open.json)")
-
-    while True:
-        try:
-            resp = await context.request.get(RR_OPEN_HEARTBEAT_URL, timeout=10_000)
-
-            if resp.ok:
-                logger.debug("💓 Heartbeat OK")
-            else:
-                logger.warning(
-                    f"💔 Heartbeat failed HTTP {resp.status}"
-                )
-
-        except Exception as e:
-            logger.warning(f"💔 Heartbeat error: {e}")
-
-        await asyncio.sleep(interval_seconds)
-
-
-async def is_logged_in(page: Page) -> bool:
-    """
-    Logged-in = Deposit button visible
-    """
-    try:
-        deposit_btn = page.locator("button").filter(
-            has_text=re.compile(r"deposit", re.I)
-        )
-        return await deposit_btn.count() > 0
-    except Exception:
-        return False
-
-
-async def safe_count(locator) -> int:
-    try:
-        return await locator.count()
-    except Exception:
-        return 0
-    
 def _london_now():
     """Return 'now' as a timezone-aware datetime in Europe/London."""
     if _LONDON_TZ:
@@ -433,6 +292,38 @@ async def place_bet_rainbow_riches(
         await clear_betslip(page)
         return
 
+    # 4.5) Confirm betslip odds haven't moved since the API check
+    try:
+        odds_el = page.locator("[class*='KambiBC-betslip'][class*='odds']").first
+        if await odds_el.count():
+            raw_text = (await odds_el.inner_text()).replace("\xa0", " ").strip()
+            # Text is like "(1)  @  7/2" — extract the fractional part after "@"
+            frac_match = re.search(r"(\d+)\s*/\s*(\d+)", raw_text)
+            if frac_match:
+                num, den = int(frac_match.group(1)), int(frac_match.group(2))
+                live_odds = round(num / den + 1.0, 4)
+            else:
+                # Fallback: try parsing as a plain decimal
+                dec_match = re.search(r"[\d]+\.[\d]+", raw_text)
+                live_odds = float(dec_match.group()) if dec_match else None
+
+            if live_odds is None:
+                logger.warning(f"⚠️ Could not parse betslip odds from '{raw_text}' — proceeding without confirmation")
+            else:
+                floor = min_acceptable_odds(expected_odds)
+                if live_odds < floor:
+                    logger.warning(
+                        f"⚠️ Betslip odds {live_odds} dropped below floor {floor} "
+                        f"(expected {expected_odds}) — aborting bet"
+                    )
+                    await clear_betslip(page)
+                    return
+                logger.info(f"✅ Betslip odds confirmed: {live_odds} (expected {expected_odds})")
+        else:
+            logger.warning("⚠️ Could not read betslip odds element — proceeding without confirmation")
+    except Exception as e:
+        logger.warning(f"⚠️ Betslip odds check failed ({e}) — proceeding")
+
     # 5) Click Place Bet
     place_btn = page.locator("button").filter(
         has_text=re.compile(r"place bet", re.I)
@@ -442,85 +333,6 @@ async def place_bet_rainbow_riches(
     await place_btn.click()
 
     # 6) (Optional) confirmation hook later
-
-async def ensure_logged_in(page: Page):
-
-    # Give the site a chance to hydrate auth state
-    try:
-        await page.wait_for_selector(
-            "button:has-text('Deposit'), button:has-text('Login'), a:has-text('Login')",
-            timeout=8000
-        )
-    except Exception as e:
-            logger.exception(f"⚠️ ensure_logged_in failed safely: {e}")
-            return
-
-    # HARD RULE: only act if login button is VISIBLE
-    login_btn = page.locator("button, a").filter(
-        has_text=re.compile(r"(login|sign\\s*in)", re.I)
-    )
-
-    deposit_btn = page.locator("button").filter(
-        has_text=re.compile(r"deposit", re.I)
-    )
-
-    login_visible = await safe_count(login_btn) > 0 and await login_btn.first.is_visible()
-    deposit_visible = await safe_count(deposit_btn) > 0
-
-    if deposit_visible:
-        logger.info("🔐 Logged in (deposit visible)")
-        return
-
-    clicked_login = False
-
-    # Only click login if button is visible AND form is not already open
-    if login_visible and not await page.locator("form[data-qa='login_form']").count():
-        logger.info("🔑 Clicking Login button")
-        await login_btn.first.click()
-        clicked_login = True
-
-    # If login form did not appear and we didn't click login → abort safely
-    if not clicked_login:
-        logger.info("⏭️ Did not initiate login — skipping")
-        return
-
-    # NOW (and only now) wait for the form
-    try:
-        await page.wait_for_selector(
-            "form[data-qa='login_form']",
-            timeout=10000
-        )
-    except Exception:
-        logger.warning("❌ Login form did not appear after click — aborting login attempt")
-        return
-
-    # Username (clear + type)
-    await page.click("#username")
-    await page.keyboard.press("Control+A")
-    await page.keyboard.press("Backspace")
-    await page.keyboard.type(RR_USERNAME, delay=60)
-
-    # Password (clear + type)
-    await page.click("#password")
-    await page.keyboard.press("Control+A")
-    await page.keyboard.press("Backspace")
-    await page.keyboard.type(RR_PASSWORD, delay=60)
-
-    # Submit
-    await page.get_by_role(
-        "button",
-        name=re.compile(r"log\\s*in|sign\\s*in", re.I)
-    ).click()
-
-    # Confirm login success
-    await page.wait_for_selector(
-        "button:has-text('Deposit')",
-        timeout=15000
-    )
-
-    logger.info("✅ Login successful")
-
-    await clear_blocking_overlays(page)
 
 async def resolve_rr_runner_and_odds(context, event_id: int, runner_name: str) -> dict | None:
     """
@@ -622,154 +434,6 @@ def hhmm_to_minutes(hhmm: str) -> Optional[int]:
     except: return None
 
 # -----------------------------
-# Telegram parser
-# -----------------------------
-def parse_telegram_message(text: str):
-    try:
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        if len(lines) < 3:
-            return None
-
-        brand = lines[0].lower()
-        if BRAND_FILTERS and not any(b in brand for b in BRAND_FILTERS):
-            return None
-
-        dog = lines[1]
-        line2 = lines[2].replace("–", "-")
-        track, race_time = line2.split("-")
-        track = track.strip()
-        race_time = race_time.strip()
-
-        back_line = next((l for l in lines if l.lower().startswith("back:")), None)
-        back_odds = None
-        if back_line:
-            m = re.search(r"(\d+(?:\.\d+)?)", back_line)
-            if m:
-                back_odds = float(m.group(1))
-
-        value_line = next((l for l in lines if "value" in l.lower()), None)
-        value_pct = None
-        if value_line:
-            m = re.search(r"(\d+(?:\.\d+)?)\s*%", value_line)
-            if m:
-                value_pct = float(m.group(1))
-
-        return {
-            "dog": dog,
-            "track": track,
-            "time": race_time,
-            "back_odds": back_odds,
-            "value": value_pct,
-        }
-    except Exception as e:
-        print(f"❌ Parse error: {e}")
-        return None
-
-
-# -----------------------------
-# Overlay handling / page readiness
-# -----------------------------
-async def clear_blocking_overlays(page: Page, timeout_ms: int = 8000) -> bool:
-    """Dismiss common overlays (cookie, reality check, wallet/GBP modal, generic dialogs)."""
-    try:
-        if page.is_closed():
-            return False
-    except Exception:
-        return False
-
-    dismissed = False
-    slice_timeout = max(1500, timeout_ms // 4)
-
-    # A) Usual suspects
-    patterns = [
-        # Reality check / generic popup overlays
-        ("div[data-component='RealityCheckPopup'], .RealityCheckPopupOverlay, .css-fjv5kt-PopupOverlay-RealityCheckPopupOverlay",
-         ["Continue", "OK", "I Understand", "Close", "Proceed"]),
-        ("[data-component*='Popup'], [role='dialog'], [class*='PopupOverlay'], .modal, .overlay",
-         ["Continue", "OK", "Close", "Got it", "Accept", "I agree"]),
-        # Cookie banners
-        ("[id*='cookie'], [class*='cookie'], [aria-label*='cookie']",
-         ["Accept", "I agree", "Got it", "OK"]),
-    ]
-
-    for overlay_sel, btn_texts in patterns:
-        try:
-            overlay = page.locator(overlay_sel).first
-            if await overlay.count():
-                try:
-                    await overlay.wait_for(state="visible", timeout=slice_timeout)
-                except Exception:
-                    pass
-                if await overlay.is_visible():
-                    for t in btn_texts:
-                        btn = overlay.locator(f":is(button,[role='button']):has-text('{t}')").first
-                        if await btn.count():
-                            try:
-                                await btn.click()
-                                dismissed = True
-                                break
-                            except Exception:
-                                try:
-                                    await btn.evaluate("el => el.click()")
-                                    dismissed = True
-                                    break
-                                except Exception:
-                                    pass
-                    if not dismissed:
-                        try:
-                            await page.keyboard.press("Escape")
-                            await page.wait_for_timeout(150)
-                            if not await overlay.is_visible():
-                                dismissed = True
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-
-    # B) Wallet/Deposit modal specific to Betmaster (strings seen in your log)
-    try:
-        # Look for any dialog/modal containing these cues
-        wallet_dialog = page.locator(
-            ":is([role='dialog'], [class*='modal'], [data-component*='Popup'], body)"
-        ).filter(has_text=re.compile(r"(choose\s+wallet|deposit|gbp)", re.I)).first
-
-        if await wallet_dialog.count():
-            # Prefer clicking a wallet/currency or a primary continue/close action
-            candidates = [
-                ":is(button,[role='button']):has-text('GBP')",
-                ":is(button,[role='button']):has-text('Continue')",
-                ":is(button,[role='button']):has-text('OK')",
-                ":is(button,[role='button']):has-text('Close')",
-                "[aria-label='Close']",
-            ]
-            for sel in candidates:
-                btn = wallet_dialog.locator(sel).first
-                if await btn.count():
-                    try:
-                        await btn.click()
-                        dismissed = True
-                        break
-                    except Exception:
-                        try:
-                            await btn.evaluate("el => el.click()")
-                            dismissed = True
-                            break
-                        except Exception:
-                            pass
-            # Last resort: press Escape
-            if not dismissed:
-                try:
-                    await page.keyboard.press("Escape")
-                    await page.wait_for_timeout(150)
-                    dismissed = True
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    return dismissed
-
-# -----------------------------
 # Betmaster API resolver
 # -----------------------------
 async def fetch_json_request(context, url):
@@ -833,9 +497,16 @@ async def handle_tip(tip, pageA, pageB):
 
     try:
         # -------------------------------
+        # 0) Session guard
+        # -------------------------------
+        if await is_logged_out(pageA):
+            logger.warning("🔒 Session expired — re-logging in before handling tip")
+            await ensure_logged_in(pageA)
+
+        # -------------------------------
         # 1) Parse core fields
         # -------------------------------
-        
+
         dog = tip["dog"]
         track = tip["track"]
         off_time = tip["time"]
@@ -971,27 +642,80 @@ async def handle_tip(tip, pageA, pageB):
     except Exception as e:
         logger.exception(f"🔥 handle_tip crashed: {e}")
 # -----------------------------
-# Overlay sweeper (periodic)
+# Fake-tip mode (no Telegram)
 # -----------------------------
-async def overlay_sweeper(pageA: Page, pageB: Page, interval_seconds: float = 10.0):
-    while True:
+async def run_fake_tip_mode(
+    queue: asyncio.Queue,
+    processing_lock: asyncio.Lock,
+    pageA,
+    pageB,
+    initial_tip: str | None = None,
+):
+    """
+    Replaces the Telegram listener with a local stdin loop.
+    Paste a multi-line tip, then press Enter on a blank line to submit.
+    Pass an initial tip via --fake-tip to fire one immediately on startup.
+    """
+    from telegram_handler import parse_telegram_message
+
+    async def worker():
+        while True:
+            tip_text = await queue.get()
+            try:
+                async with processing_lock:
+                    tip = parse_telegram_message(tip_text)
+                    if not tip:
+                        logger.warning("[fake] ❌ Could not parse tip — check format")
+                        continue
+                    await handle_tip(tip, pageA, pageB)
+            except Exception as e:
+                logger.exception(f"[fake] handle_tip error: {e}")
+            finally:
+                queue.task_done()
+
+    worker_task = asyncio.create_task(worker())
+
+    if initial_tip:
+        logger.info(f"[fake] Firing initial tip from --fake-tip flag")
+        await queue.put(initial_tip.replace("\\n", "\n"))
+
+    loop = asyncio.get_event_loop()
+    print("\n[fake] ── Fake tip mode active ──────────────────────────────")
+    print("[fake] Paste a tip (same format as Telegram), then press Enter")
+    print("[fake] on a blank line to submit. Ctrl+C to exit.\n")
+
+    try:
+        while True:
+            lines = []
+            while True:
+                line = await loop.run_in_executor(None, input, "")
+                if line == "":
+                    break
+                lines.append(line)
+            if lines:
+                tip_text = "\n".join(lines)
+                logger.info(f"[fake] Enqueuing tip:\n{tip_text}")
+                await queue.put(tip_text)
+    except (KeyboardInterrupt, EOFError):
+        logger.info("[fake] Exiting fake tip mode")
+    finally:
+        worker_task.cancel()
         try:
-            await clear_blocking_overlays(pageA)
-            await clear_blocking_overlays(pageB)
+            await worker_task
         except Exception:
             pass
-        await asyncio.sleep(interval_seconds)
+
 
 # -----------------------------
 # Orchestration
 # -----------------------------
-async def run_bot():
+async def run_bot(fake_tip: str | None = None):
     # --- use persistent profile instead of ephemeral context ---
     playwright, browser, pageA, pageB = await make_persistent_browser()
 
     print(f"[nav] Tab A → {BASE_URL}")
     try:
-        await pageA.goto(BASE_URL, wait_until="domcontentloaded", timeout=20000)
+        await pageA.goto(BASE_URL, wait_until="domcontentloaded", timeout=40000)
     except Exception as e:
         print(f"[nav] Failed to load homepage {BASE_URL}: {e}")
     await clear_blocking_overlays(pageA)
@@ -1032,52 +756,25 @@ async def run_bot():
     logger.info("💓 Session heartbeat started (API)")
 
 
-    # --- Telegram listener setup ---
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-
-
-    await client.start(bot_token=BOT_TOKEN)
-    print("🤖 Listening for Telegram tips... (Ctrl+C to stop)")
-
     queue: asyncio.Queue[str] = asyncio.Queue()
     processing_lock = asyncio.Lock()
-
-    @client.on(events.NewMessage)
-    async def _on_msg(event):
-        try:
-            text = event.message.raw_text or ""
-            if BRAND_FILTERS and not any(b in text.lower() for b in BRAND_FILTERS):
-                return
-            await queue.put(text)
-        except Exception as e:
-            print(f"⚠️ Telegram handler error: {e}")
-
-    async def worker():
-        while True:
-            tip_text = await queue.get()
-            try:
-                async with processing_lock:
-
-                    tip = parse_telegram_message(tip_text)
-                    if not tip:
-                        continue
-
-                    await handle_tip(tip, pageA, pageB)
-
-            except Exception as e:
-                import traceback
-                print(f"⚠️ handle_tip error: {e}")
-                traceback.print_exc()
-            finally:
-                queue.task_done()
-
-    worker_task = asyncio.create_task(worker())
     sweeper_task = asyncio.create_task(overlay_sweeper(pageA, pageB, interval_seconds=10.0))
 
     try:
-        await client.run_until_disconnected()
+        if fake_tip is not None:
+            # --- Fake tip mode: no Telegram connection needed ---
+            await run_fake_tip_mode(queue, processing_lock, pageA, pageB, initial_tip=fake_tip)
+        else:
+            # --- Live mode: connect to Telegram ---
+            client, worker_task = await setup_telegram(queue, processing_lock, handle_tip, pageA, pageB)
+            await client.run_until_disconnected()
+            worker_task.cancel()
+            try:
+                await worker_task
+            except Exception:
+                pass
     finally:
-        for task in (worker_task, sweeper_task, keepalive_task, heartbeat_task):
+        for task in (sweeper_task, keepalive_task, heartbeat_task):
             task.cancel()
             try:
                 await task
@@ -1104,7 +801,11 @@ async def main():
     parser.add_argument("--max-odds", type=float, help="Skip if tip Back exceeds this (e.g. 5)")
     parser.add_argument("--odds-tol-abs", type=float, help="Absolute price tolerance (default 0.02)")
     parser.add_argument("--odds-tol-pct", type=float, help="Relative price tolerance in percent")
-    parser.add_argument("--dry-run", type=str, help="Test a single tip text (\\n between lines)")
+    parser.add_argument(
+        "--fake-tip", type=str, metavar="TIP_TEXT",
+        help="Run without Telegram using a fake tip. Use \\n between lines. "
+             "Omit to enter tips interactively once the bot starts.",
+    )
     args = parser.parse_args()
 
     cfg = CFG
@@ -1115,7 +816,7 @@ async def main():
     if args.odds_tol_pct is not None: cfg = replace(cfg, odds_tolerance_pct=float(args.odds_tol_pct))
     globals()["CFG"] = cfg
 
-    await run_bot()
+    await run_bot(fake_tip=args.fake_tip)
 
 if __name__ == "__main__":
     asyncio.run(main())
