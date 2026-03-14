@@ -231,7 +231,7 @@ async def clear_blocking_overlays(page: Page, timeout_ms: int = 8000) -> bool:
 # -----------------------------
 # Login flow
 # -----------------------------
-async def ensure_logged_in(page: Page):
+async def ensure_logged_in(page: Page, _retries: int = 2):
     try:
         await page.wait_for_selector(
             "button:has-text('Deposit'), button:has-text('Login'), a:has-text('Login')",
@@ -277,10 +277,36 @@ async def ensure_logged_in(page: Page):
     await page.keyboard.press("Backspace")
     await page.keyboard.type(RR_PASSWORD, delay=60)
 
-    await page.get_by_role("button", name=re.compile(r"log in", re.I)).click()
-    await page.wait_for_selector("button:has-text('Deposit')", timeout=15000)
-    logger.info("✅ Login successful")
-    await clear_blocking_overlays(page)
+    # Watch for HTTP 456 responses during login submission
+    got_456 = False
+
+    def _on_response(response):
+        nonlocal got_456
+        if response.status == 456:
+            got_456 = True
+            logger.warning(f"⚠️ HTTP 456 received from {response.url}")
+
+    page.on("response", _on_response)
+    try:
+        await page.get_by_role("button", name=re.compile(r"log in", re.I)).click()
+        # Brief wait to let the login request(s) complete before checking for 456
+        await page.wait_for_timeout(1500)
+
+        if got_456:
+            if _retries > 0:
+                logger.warning(f"🔄 HTTP 456 during login — refreshing and retrying ({_retries} attempt(s) left)")
+                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                await clear_blocking_overlays(page)
+                return await ensure_logged_in(page, _retries=_retries - 1)
+            else:
+                logger.error("❌ HTTP 456 persisted after all retries — giving up")
+                return
+
+        await page.wait_for_selector("button:has-text('Deposit')", timeout=15000)
+        logger.info("✅ Login successful")
+        await clear_blocking_overlays(page)
+    finally:
+        page.remove_listener("response", _on_response)
 
 
 # -----------------------------
